@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Arduino / ESP32 build artifacts
+build/
+*.o
+*.elf
+*.bin
+
+# VSCode / IDE metadata
+.vscode/
+.idea/
+
+# Python cache (if any)
+__pycache__/

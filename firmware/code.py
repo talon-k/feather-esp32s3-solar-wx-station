@@ -1,8 +1,16 @@
 # ============================================================
 # Feather ESP32-S3 BME280 → MQTT (Home Assistant Discovery)
-# Firmware Version: v1.5.2b-alt  (2025-11-02)
+# Firmware Version: v1.5.3  (2025-11-23)
 #
 # CHANGELOG (highlights):
+# v1.5.3  - Debug-aware watchdog + SLP bias + HA batt threshold + sleep/phase cleanup
+#           • Watchdog timeouts automatically relaxed when DEBUG=True.
+#           • Apply configurable sea-level pressure bias (SLP_OFFSET_HPA).
+#           • New HA diagnostic sensor: battery_low_threshold (%).
+#           • Unified sleep-period computation for day/night + low-battery.
+#           • Removed unused SUN_LAST_FILE state and simplified phase handling.
+#           • NTP now prefers direct Google time server IPs with fallback host.
+#             with shorter HTTP timeouts and feeds to avoid ~60 s WD resets.
 # v1.5.2b-alt - Implement robust Watchdog Manager
 #           • Replaces ad-hoc WDT calls with a central WatchdogMgr.
 #           • WD is never touched when ENABLE_WATCHDOG=False.
@@ -27,7 +35,7 @@
 # v1.5.1e — Night-mode fix + epoch correction
 # ============================================================
 
-FW_VERSION = "v1.5.2b-alt"
+FW_VERSION = "v1.5.3"
 
 import time
 import json
@@ -76,7 +84,8 @@ DEVICE_ID = "feather01_bme280"
 PUBLISH_PERIOD_SEC = 180        # nominal daytime cadence
 BATTERY_LOW_THRESHOLD = 25.0
 LOW_BATT_EXTRA_SLEEP = 900      # +15 min when battery low
-SITE_ALT_M = 270                # elevation (m) for sea-level pressure calc
+SITE_ALT_M = 273                # elevation (m) for sea-level pressure calc
+SLP_OFFSET_HPA = -1.5           # additive bias to sea-level pressure (hPa); negative to reduce reported SLP (CWOP)
 
 # Sleep behavior
 SLEEP_MODE = 'light'            # 'none' | 'light' | 'deep'
@@ -109,19 +118,29 @@ MQTT_RECV_TIMEOUT = 35
 RTC_RESYNC_S = 24 * 3600
 RESYNC_CYCLES = max(1, int(RTC_RESYNC_S / PUBLISH_PERIOD_SEC))
 
+# NTP servers (prefer IP to avoid DNS flakiness; keep a fallback name/IP)
+NTP_PRIMARY_HOST = "216.239.35.0"   # time.google.com
+NTP_FALLBACK_HOST = "216.239.35.4"  # time2.google.com
+
 # NVM write throttling
 _HEARTBEAT_FLUSH_INTERVAL = 10
 
-# Optional daily HA discovery refresh
+# HA discovery refresh
 DAILY_DISCOVERY_REFRESH_S = 24 * 3600
-DAILY_DISCOVERY_REFRESH_BOOT_THRESHOLD = max(1, int(DAILY_DISCOVERY_REFRESH_S / PUBLISH_PERIOD_SEC))
 
 # Debug logging
-DEBUG = True
+DEBUG = False
 
 # Watchdog
 ENABLE_WATCHDOG = True
-WDT_TIMEOUT_S = 8
+ACTIVE_WDT_TIMEOUT_S = 100       # main active-cycle WDT window (Wi-Fi + HTTP + MQTT)
+
+# When DEBUG is enabled, watchdog timeouts are automatically relaxed so that
+# slower debug builds / verbose logging don't trip the WDT. Scale any
+# requested timeout by DEBUG_WDT_SCALE and enforce a floor.
+DEBUG_WDT_SCALE = 3
+DEBUG_WDT_MIN_ACTIVE_S = 30      # minimum active-cycle timeout when DEBUG=True
+DEBUG_WDT_MIN_SLEEP_S  = 120     # minimum sleep-time timeout when DEBUG=True
 
 # --- SD logging (SPI) ---
 ENABLE_SD_LOGGING = True
@@ -150,12 +169,10 @@ fetch_tz_ok = False
 # State file names (all under SD_STATE_DIR)
 DISCOVERY_HASH_FILE       = SD_STATE_DIR + "/ha_discovery.sha"
 DISCOVERY_LAST_EPOCH_FILE = SD_STATE_DIR + "/ha_discovery.last"
-DISCOVERY_BOOTS_FILE      = SD_STATE_DIR + "/ha_discovery.boots"
 DEVICE_INFO_HASH_FILE     = SD_STATE_DIR + "/device_info.sha"
 DEVICE_INFO_LAST_FILE     = SD_STATE_DIR + "/device_info.last"
 DEVICE_INFO_REFRESH_S     = 24 * 3600
 SUN_FILE                  = SD_STATE_DIR + "/sun.json"   # stores LOCAL sunrise/sunset ISO + epoch + local day
-SUN_LAST_FILE             = SD_STATE_DIR + "/sun.last"   # last successful LOCAL-day fetch epoch
 TZ_FILE                   = SD_STATE_DIR + "/tz.json"    # cache from WorldTimeAPI
 
 # Hardware handles
@@ -200,7 +217,6 @@ pix(COL_BOOT)
 LOG_BUFFER, _LOG_MAX = [], 500
 
 # ---------- Time helpers ----------
-
 def _now_epoch_utc():
     """RTC→epoch (seconds) for CP9.x without extra offsets."""
     try:
@@ -347,7 +363,7 @@ def sd_log_lines(lines):
         print("SD: sd_log_lines error:", e)
 
 
-def sd_log_sample(payload: dict):
+def sd_log_sample(payload):
     if not SD_OK:
         return
     try:
@@ -397,7 +413,7 @@ def sd_health(msg):
         print("SD: sd_health error:", e)
 
 
-def sd_crash(exc: Exception):
+def sd_crash(exc):
     if not SD_OK:
         return
     try:
@@ -496,13 +512,24 @@ class WatchdogMgr:
     def __init__(self):
         self.active = False
 
+    def _effective_timeout(self, requested, for_sleep=False):
+        """Apply DEBUG-aware scaling/floor to requested timeout."""
+        t = int(requested)
+        if DEBUG:
+            # Scale and floor differently for active vs sleep phases.
+            t = int(t * DEBUG_WDT_SCALE)
+            floor = DEBUG_WDT_MIN_SLEEP_S if for_sleep else DEBUG_WDT_MIN_ACTIVE_S
+            if t < floor:
+                t = floor
+        return t
+
     def start(self, timeout_s):
         """Arm/resize WD in RESET mode and feed. No-ops if disabled."""
         if not ENABLE_WATCHDOG:
             self.active = False
             return
         try:
-            WDT.timeout = int(timeout_s)
+            WDT.timeout = self._effective_timeout(timeout_s, for_sleep=False)
             WDT.mode = WatchDogMode.RESET
             WDT.feed()
             self.active = True
@@ -531,8 +558,8 @@ class WatchdogMgr:
         if not self.active:
             return
         try:
-            t = max(int(math.ceil(sleep_s)) + safety_margin_s, min_timeout_s)
-            WDT.timeout = t
+            req = max(int(math.ceil(sleep_s)) + safety_margin_s, min_timeout_s)
+            WDT.timeout = self._effective_timeout(req, for_sleep=True)
             WDT.mode = WatchDogMode.RESET
             WDT.feed()
         except Exception:
@@ -565,7 +592,6 @@ def _wdt_sleep(seconds):
         time.sleep(chunk)
 
 # ---------- I2C helpers ----------
-
 def _bus_stuck():
     try:
         global i2c
@@ -861,9 +887,12 @@ def fetch_tz_if_needed(pool, force=False):
         url = f"https://worldtimeapi.org/api/timezone/{LOCAL_TZ}"
         debug("WorldTimeAPI fetch: " + LOCAL_TZ)
         last_exc = None
-        for attempt in range(2):
+        # NOTE: keep this section watchdog-friendly. Timeouts are bounded
+        # and we feed the WD around each blocking call.
+        for attempt in range(2):  # 1 initial try + 1 retry
             try:
-                r = sess.get(url, timeout=12)
+                WD.feed()
+                r = sess.get(url, timeout=8)
                 data = r.json(); r.close()
                 off = data.get("utc_offset", "+00:00")
                 sign = -1 if off.startswith("-") else 1
@@ -877,6 +906,7 @@ def fetch_tz_if_needed(pool, force=False):
                 return True
             except Exception as e:
                 last_exc = e
+                WD.feed()
                 time.sleep(1.5)
         log_message(f"WorldTimeAPI fetch failed: {last_exc}")
     except Exception as e:
@@ -888,7 +918,8 @@ def fetch_tz_if_needed(pool, force=False):
             sess = _http_session(pool)
             url = ("https://api.openweathermap.org/data/2.5/weather?lat="
                    + str(OW_LAT) + "&lon=" + str(OW_LON) + "&appid=" + str(OW_API_KEY))
-            r = sess.get(url, timeout=10)
+            WD.feed()
+            r = sess.get(url, timeout=8)
             data = r.json(); r.close()
             utc_off_sec = int(data.get("timezone", 0))
             _TZ_CACHE = {"tz": LOCAL_TZ, "utc_offset_sec": utc_off_sec, "abbrev": "", "dst": None}
@@ -952,7 +983,6 @@ def _format_local_display(tt):
         return None
 
 # ---------- OpenWeather sunrise/sunset (daily @ 03:00 local) ----------
-
 def _sun_cache_valid_for_today(local_date):
     try:
         return _SUN_CACHE and _SUN_CACHE.get("local_day") == local_date
@@ -972,10 +1002,6 @@ def _load_sun_from_disk():
 def _save_sun_to_disk():
     if _SUN_CACHE:
         _write_json_file(SUN_FILE, _SUN_CACHE)
-        try:
-            _write_json_file(SUN_LAST_FILE, {"last": _SUN_CACHE.get("fetched_local_ep", 0)})
-        except Exception:
-            pass
 
 
 def _need_sun_refresh(now_local_ep, now_local_date, force_if_missing=False):
@@ -1013,13 +1039,14 @@ def refresh_sun_times_if_due(pool, now_utc_ep, force_if_missing=False):
         return True
     if not _need_sun_refresh(loc_ep, loc_date, force_if_missing=force_if_missing):
         return _sun_cache_valid_for_today(loc_date)
-    # Fetch from OWM
+    # Fetch from OWM (watchdog-friendly: bounded timeout + feeds)
     try:
         debug("Fetching sunrise/sunset via OpenWeatherMap")
         sess = _http_session(pool)
         url = ("https://api.openweathermap.org/data/2.5/weather?lat="
                + str(OW_LAT) + "&lon=" + str(OW_LON) + "&appid=" + str(OW_API_KEY))
-        r = sess.get(url, timeout=15)
+        WD.feed()
+        r = sess.get(url, timeout=10)
         data = r.json(); r.close()
         # Opportunistic TZ set from OWM if needed
         try:
@@ -1033,6 +1060,7 @@ def refresh_sun_times_if_due(pool, now_utc_ep, force_if_missing=False):
         rise_utc = int(sysd.get("sunrise", 0)); set_utc = int(sysd.get("sunset", 0))
         if rise_utc <= 0 or set_utc <= 0:
             raise ValueError("OWM sunrise/sunset missing")
+        WD.feed()
         rise_loc_ep, rise_tt, _ = _local_from_utc_epoch(rise_utc)
         set_loc_ep, set_tt, _  = _local_from_utc_epoch(set_utc)
         _SUN_CACHE = {
@@ -1209,7 +1237,9 @@ def build_payload(extra_fields=None):
     debug("Payload build: sampling BME")
     # Sample BME in forced mode
     t_c, rh, p_abs = sample_bme_forced()
-    p_sl = round(sea_level_pressure_hpa(p_abs, SITE_ALT_M, temp_c=t_c, rh_pct=rh), 2)
+    p_sl = sea_level_pressure_hpa(p_abs, SITE_ALT_M, temp_c=t_c, rh_pct=rh)
+    # Apply configurable site-specific bias (CWOP tuning)
+    p_sl = round(p_sl + SLP_OFFSET_HPA, 2)
     t_c = round(t_c, 2); t_f = round((t_c*9/5)+32, 2)
     rh = round(rh, 2)
     dp_c = round(dewpoint_c(t_c, rh), 2); dp_f = round((dp_c*9/5)+32, 2)
@@ -1257,6 +1287,7 @@ def build_payload(extra_fields=None):
         "heat_index_C": hi_c, "heat_index_F": hi_f,
         "p_hpa": p_sl, "humidity": rh,
         "battery_percent": batt_pct, "battery_voltage": batt_v, "battery_low": batt_low,
+        "battery_low_threshold": BATTERY_LOW_THRESHOLD,
         "client_id": CLIENT_ID, "uptime_s": int(time.monotonic()),
         "heartbeat": hb, "fail_count": fc,
         "rtc_iso": rtc_iso, "rtc_epoch": rtc_ep,
@@ -1276,8 +1307,33 @@ def build_payload(extra_fields=None):
     debug("Payload build: done")
     return payload
 
-# ---------- Wi-Fi ----------
+# ---------- Sleep helpers ----------
+def _battery_is_low():
+    """Return True if the MAX17048 reports battery at/below threshold."""
+    if not (HAVE_BATTERY and max17048):
+        return False
+    try:
+        return max17048.cell_percent <= BATTERY_LOW_THRESHOLD
+    except Exception:
+        return False
 
+
+def compute_sleep_period(is_night, battery_low):
+    """
+    Compute total sleep period (seconds) plus the individual
+    night and battery contributions for logging/diagnostics.
+    """
+    batt_extra = LOW_BATT_EXTRA_SLEEP if battery_low else 0
+    night_extra = 0
+    try:
+        if NIGHT_MODE_ENABLED and is_night:
+            night_extra = max(0, NIGHT_SLEEP_SEC - PUBLISH_PERIOD_SEC)
+    except Exception:
+        night_extra = 0
+    sleep_period = int(PUBLISH_PERIOD_SEC + batt_extra + night_extra)
+    return sleep_period, batt_extra, night_extra
+
+# ---------- Wi-Fi ----------
 def ensure_wifi(total_attempts=6):
     delays = [2, 3, 5, 8, 10, 10]
     attempts_used = 0
@@ -1360,6 +1416,7 @@ def publish_ha_discovery(mqtt_client):
         {"oid":"active_s","name":"Active s","unit":"s","dclass":None,"sclass":"measurement","tpl":"{{ ((value_json.active_ms | default(0)) / 1000) | round(0) }}"},
         {"oid":"sleep_s","name":"Sleep s","unit":"s","dclass":None,"sclass":"measurement","tpl":"{{ value_json.sleep_s }}"},
         {"oid":"wifi_attempts","name":"WiFi Attempts","unit":None,"dclass":None,"sclass":"measurement","tpl":"{{ value_json.wifi_attempts }}"},
+        {"oid":"battery_low_threshold","name":"Battery Low Threshold","unit":"%","dclass":None,"sclass":"measurement","tpl":"{{ value_json.battery_low_threshold }}"},
         # Local time sensors
         {"oid":"local_date","name":"Local Date","unit":None,"dclass":None,"sclass":None,"tpl":"{{ value_json.local_date }}"},
         {"oid":"local_sunrise","name":"Local Sunrise","unit":None,"dclass":None,"sclass":None,"tpl":"{{ value_json.local_sunrise_iso | default('') }}"},
@@ -1382,7 +1439,9 @@ def publish_ha_discovery(mqtt_client):
         if s["unit"] is not None:  cfg["unit_of_measurement"] = s["unit"]
         if s["dclass"] is not None: cfg["device_class"] = s["dclass"]
         if s["sclass"] is not None: cfg["state_class"] = s["sclass"]
-        if s["oid"] in ("heartbeat","fail_count","rtc_iso","rtc_sync_age_s","last_error","wifi_attempts","local_date","local_sunrise","local_sunset"):
+        if s["oid"] in ("heartbeat","fail_count","rtc_iso","rtc_sync_age_s","last_error",
+                        "wifi_attempts","battery_low_threshold",
+                        "local_date","local_sunrise","local_sunset"):
             cfg["entity_category"] = "diagnostic"
         pairs.append((cfg_topic, cfg))
 
@@ -1563,28 +1622,56 @@ def _weekday_sakamoto(y, m, d):
 
 
 def sync_rtc_via_ntp_if_needed(pool, force=False):
+    """Sync DS3231 via NTP if needed, using primary + fallback Google time IPs.
+
+    Keeps WD fed around network calls and uses short-ish timeouts so we don't
+    burn the whole active window on a hung NTP server.
+    """
     if not RTC_PRESENT:
         return False
+
     need = force or _rtc_looks_unset() or (_get_cycles_since_sync() >= RESYNC_CYCLES)
     if not need:
         return False
-    try:
-        debug("RTC NTP sync: start")
-        ntp = adafruit_ntp.NTP(pool, server="time.google.com", tz_offset=0)
-        tm = ntp.datetime
-        w_sun0 = _weekday_sakamoto(tm.tm_year, tm.tm_mon, tm.tm_mday)
-        w_mon0 = (w_sun0 - 1) % 7
-        rtc.datetime = time.struct_time((tm.tm_year, tm.tm_mon, tm.tm_mday,
-                                         tm.tm_hour, tm.tm_min, tm.tm_sec,
-                                         w_mon0, -1, -1))
-        _set_cycles_since_sync(0)
-        log_message("RTC set via NTP")
-        sd_health("RTC synced via NTP")
-        _prune_sd(_now_epoch_utc())
-        return True
-    except Exception as e:
-        log_message(f"NTP sync failed: {e}")
-        return False
+
+    hosts = (NTP_PRIMARY_HOST, NTP_FALLBACK_HOST)
+    last_exc = None
+
+    for host in hosts:
+        try:
+            debug("RTC NTP sync: trying " + host)
+            WD.feed()
+            # adafruit_ntp.NTP doesn't expose a timeout param; the underlying
+            # socket inherits from the pool. To keep our WD happy, we keep the
+            # number of attempts small and bail quickly on errors.
+            ntp = adafruit_ntp.NTP(pool, server=host, tz_offset=0)
+            WD.feed()
+            tm = ntp.datetime
+            WD.feed()
+
+            # Convert weekday (Sunday-0) to Monday-0 as DS3231 expects
+            w_sun0 = _weekday_sakamoto(tm.tm_year, tm.tm_mon, tm.tm_mday)
+            w_mon0 = (w_sun0 - 1) % 7
+            rtc.datetime = time.struct_time(
+                (tm.tm_year, tm.tm_mon, tm.tm_mday,
+                 tm.tm_hour, tm.tm_min, tm.tm_sec,
+                 w_mon0, -1, -1)
+            )
+            _set_cycles_since_sync(0)
+            log_message(f"RTC set via NTP ({host})")
+            sd_health(f"RTC synced via NTP host={host}")
+            _prune_sd(_now_epoch_utc())
+            return True
+        except Exception as e:
+            last_exc = e
+            log_message(f"NTP sync failed for host {host}: {e}")
+            # Small delay but feed WD so we don't accumulate long blocking spans
+            WD.feed()
+            _wdt_sleep(1.0)
+
+    if last_exc is not None:
+        log_message(f"NTP sync failed (all hosts): {last_exc}")
+    return False
 
 # ---------- MQTT connect/publish with retries ----------
 
@@ -1644,9 +1731,13 @@ def publish_offline_status():
 # ---------- Single publish cycle ----------
 
 def publish_once():
-    global fetch_tz_ok
+    global fetch_tz_ok, _PHASE
+    _PHASE = "cycle"
     cycle_t0 = time.monotonic()
-    WD.start(WDT_TIMEOUT_S); WD.feed()
+    # Use a single generous active-phase watchdog window; individual
+    # network calls are still short, but Wi-Fi retries + TZ/OWM + MQTT
+    # can legitimately span >60 s under bad RF.
+    WD.start(ACTIVE_WDT_TIMEOUT_S); WD.feed()
 
     # Mount SD (idempotent)
     print("BOOT: about to mount SD…")
@@ -1655,9 +1746,6 @@ def publish_once():
             print("SD: mount failed (fail-open), continuing without SD")
     except Exception as _e:
         print("SD: init error:", _e)
-
-    # Widen WDT during active cycle
-    WD.start(60)
 
     wifi.radio.enabled = True
     ok_wifi, attempts, wifi_ms = ensure_wifi(total_attempts=6)
@@ -1690,25 +1778,20 @@ def publish_once():
         "modem_sleep": (SLEEP_MODE == 'light'),
     })
 
-    # Compute planned sleep now so HA sees it this publish
-    batt_extra = 0
-    try:
-        if HAVE_BATTERY and max17048 and (max17048.cell_percent <= BATTERY_LOW_THRESHOLD):
-            batt_extra = LOW_BATT_EXTRA_SLEEP
-    except Exception:
-        pass
-    night_extra = 0
-    try:
-        if night_flag:
-            night_extra = max(0, NIGHT_SLEEP_SEC - PUBLISH_PERIOD_SEC)
-    except Exception:
-        pass
-    planned_sleep_s = int(PUBLISH_PERIOD_SEC + batt_extra + night_extra)
+    # Compute planned sleep using unified sleep helper
+    batt_low = _battery_is_low()
+    planned_sleep_s, _, _ = compute_sleep_period(night_flag, batt_low)
     extra_fields["sleep_s"] = planned_sleep_s
+
+    # Take a fresh sample + build payload
+    _PHASE = "sample"
 
     # Build payload & include active_ms
     payload = build_payload(extra_fields)
     payload["active_ms"] = int((time.monotonic() - cycle_t0) * 1000)
+
+    # Publishing state to MQTT / HA
+    _PHASE = "post_publish"
 
     ok = mqtt_publish_with_retries(payload, max_attempts=3)
 
@@ -1764,6 +1847,7 @@ try:
         if not success:
             hb, fails = _get_heartbeat_and_fails()
             if fails >= MAX_CONSEC_FAILS:
+                _PHASE = "fail_throttle"
                 log_message(f"Hit {fails} fails — long sleep {LONG_SLEEP_AFTER_FAILS}s then hard reset")
                 sd_health(f"fail-throttle: sleeping {LONG_SLEEP_AFTER_FAILS}s before reset")
                 try: publish_offline_status()
@@ -1776,27 +1860,30 @@ try:
                 sd_health("enter deep sleep (fail throttle)")
                 alarm.exit_and_deep_sleep_until_alarms(wake)
 
-        # Sleep period selection
-        extra = 0
-        try:
-            if HAVE_BATTERY and max17048 and (max17048.cell_percent <= BATTERY_LOW_THRESHOLD):
-                extra = LOW_BATT_EXTRA_SLEEP
-                log_message(f"Battery low; adding {LOW_BATT_EXTRA_SLEEP}s to sleep")
-        except Exception:
-            pass
-
+        # Sleep period selection (unified helper)
+        batt_low = _battery_is_low()
         now_utc_ep = _now_epoch_utc()
-        night_extra = 0
+        is_night = False
         try:
-            if fetch_tz_ok and is_night_now(now_utc_ep):
-                night_extra = max(0, NIGHT_SLEEP_SEC - PUBLISH_PERIOD_SEC)
+            if fetch_tz_ok:
+                is_night = is_night_now(now_utc_ep)
         except Exception:
-            pass
+            is_night = False
 
-        sleep_period = PUBLISH_PERIOD_SEC + extra + night_extra
+        sleep_period, batt_extra, night_extra = compute_sleep_period(is_night, batt_low)
+        if batt_extra > 0:
+            log_message(f"Battery low; adding {batt_extra}s to sleep")
+
+        # Planning next sleep interval
+        _PHASE = "sleep_plan"
+
+        night_flag_str = "1" if night_extra > 0 else "0"
+        batt_flag_str  = "1" if batt_extra > 0 else "0"
 
         try:
-            sd_health(f"sleep plan s={sleep_period} night={'1' if night_extra>0 else '0'} batt_extra={'1' if extra>0 else '0'}")
+            sd_health(f"sleep plan s={sleep_period} ")
+            sd_health(f"night={night_flag_str} ")
+            sd_health(f"batt_extra={batt_flag_str}")
         except Exception:
             pass
 
@@ -1805,6 +1892,9 @@ try:
 
         pix_off()
         log_message(f"Sleeping ({SLEEP_MODE}) for {sleep_period} s (FW {FW_VERSION})")
+
+        # Transitioning into sleep
+        _PHASE = "sleep"
 
         try:
             sd_log_sample({
@@ -1837,6 +1927,7 @@ try:
             microcontroller.reset()
 
 except Exception as e:
+    _PHASE = "exception"
     LAST_ERROR = str(e)
     log_message(f"TOP-LEVEL EXCEPTION: {LAST_ERROR}")
     try:

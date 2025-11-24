@@ -1,4 +1,3 @@
-cat > README.md << 'EOF'
 # Feather ESP32-S3 Solar Weather Station
 
 This repository contains firmware and hardware design files for a solar-powered weather station
@@ -39,5 +38,3 @@ External board that monitors the battery (BAT) line and controls the Feather EN 
    git clone https://github.com/talon-k/feather-esp32s3-solar-wx-station.git
    cd feather-esp32s3-solar-wx-station
 2. Copy firmware/code.py to the root of your Feather ESP32-S3 CIRCUITPY drive.
-
-EOF

@@ -1,8 +1,9 @@
 # ============================================================
 # Feather ESP32-S3 BME280 → MQTT (Home Assistant Discovery)
-# Firmware Version: v1.5.3  (2025-11-23)
+# Firmware Version: v1.5.4  (2026-02-21)
 #
 # CHANGELOG (highlights):
+# v1.5.4  - Fixed apparently deleted ha entities
 # v1.5.3  - Debug-aware watchdog + SLP bias + HA batt threshold + sleep/phase cleanup
 #           • Watchdog timeouts automatically relaxed when DEBUG=True.
 #           • Apply configurable sea-level pressure bias (SLP_OFFSET_HPA).
@@ -35,7 +36,7 @@
 # v1.5.1e — Night-mode fix + epoch correction
 # ============================================================
 
-FW_VERSION = "v1.5.3"
+FW_VERSION = "v1.5.4"
 
 import time
 import json
@@ -772,9 +773,6 @@ def heat_index_f(temp_f, rh_pct):
     return HI
 
 # ---------- NVM helpers ----------
-# 0..3: heartbeat (u32)
-# 4..5: fail_count (u16)
-# 6..7: cycles_since_rtc_sync (u16)
 
 def _get_counters():
     try:
@@ -1422,6 +1420,12 @@ def publish_ha_discovery(mqtt_client):
         {"oid":"local_sunrise","name":"Local Sunrise","unit":None,"dclass":None,"sclass":None,"tpl":"{{ value_json.local_sunrise_iso | default('') }}"},
         {"oid":"local_sunset","name":"Local Sunset","unit":None,"dclass":None,"sclass":None,"tpl":"{{ value_json.local_sunset_iso | default('') }}"},
     ]
+
+    if HAVE_BATTERY:
+        sensors += [
+            {"oid":"battery_percent","name":"Feather Battery","unit":"%","dclass":"battery","sclass":"measurement","tpl":"{{ value_json.battery_percent }}"},
+            {"oid":"battery_voltage","name":"Feather Battery Voltage","unit":"V","dclass":"voltage","sclass":"measurement","tpl":"{{ value_json.battery_voltage }}"},
+        ]
 
     pairs = []
     for s in sensors:

@@ -1,10 +1,19 @@
 # ============================================================
 # Feather ESP32-S3 BME280 → MQTT (Home Assistant Discovery)
-# Firmware Version: v1.5.4  (2026-02-21)
+# Firmware Version: v1.5.5  (2026-02-21)
 #
 # CHANGELOG (highlights):
+# v1.5.5  - Updated fetch_tz_if_needed() timeout 8->15
+#           • Updated fetch_tz_if_needed() logic to check sd cache and only
+#             grab if needed, same fallback logic as before
+#           • Post-review CP hardening pass (no feature changes):
+#             - Ensure HTTP responses are always closed (TZ + sun fetch paths)
+#             - Ensure MQTT clients disconnect on both success and exceptions
+#             - Publish retained 'offline' (not 'online') on top-level crash path
+#             - Add TZ cache max age refresh (24h) to avoid stale DST offsets
+#             - Reduce in-memory LOG_BUFFER from 500 to 200 lines
 # v1.5.4  - Fixed apparently deleted ha entities
-# v1.5.3  - Debug-aware watchdog + SLP bias + HA batt threshold + sleep/phase cleanup
+# v1.5.3  - Debug-aware WD + SLP bias + HA batt threshold + sleep/phase cleanup
 #           • Watchdog timeouts automatically relaxed when DEBUG=True.
 #           • Apply configurable sea-level pressure bias (SLP_OFFSET_HPA).
 #           • New HA diagnostic sensor: battery_low_threshold (%).
@@ -12,31 +21,14 @@
 #           • Removed unused SUN_LAST_FILE state and simplified phase handling.
 #           • NTP now prefers direct Google time server IPs with fallback host.
 #             with shorter HTTP timeouts and feeds to avoid ~60 s WD resets.
-# v1.5.2b-alt - Implement robust Watchdog Manager
-#           • Replaces ad-hoc WDT calls with a central WatchdogMgr.
-#           • WD is never touched when ENABLE_WATCHDOG=False.
-#           • Prevents hidden arming of RAISE/RESET when WD is disabled.
-#           • Safe sleep-time timeout widening + unified feed path.
+# v1.5.2b-alt - Implemented more robust Watchdog Manager
 # v1.5.2a — Friendly-format local sunrise/sunset text
-#           • Keeps Option A (plain text) for local sunrise/sunset sensors.
-#           • Adds human-readable format:
-#             e.g. "2025-10-14 17:13:21 CDT (-05:00)"
-#           • Removes HA timestamp device_class to prevent 'unavailable' states.
-#           • Adds `_tz_offset_str()` + `_format_local_display()` helpers.
-#           • Minor internal cleanup; no schema, payload, or topic changes.
-# v1.5.2 - Timezone-aware night mode & daily sun refresh @ 03:00 local
-#           • Adds TZ support via WorldTimeAPI (no API key required).
-#           • New USER CONFIG: LOCAL_TZ (IANA/Olson ID, e.g., "America/Chicago").
-#           • New HA sensors: local_date (date), local_sunrise, local_sunset (ISO local).
-#           • Night/day evaluation now uses LOCAL time
-#           • Decouples sun refresh from NTP; schedules OWM sun refresh once daily
-#           • Robust RTC epoch handling for CircuitPython 9.x (no Y2K offset).
-#           • Cleanup: removed unused helpers; simplified SD + logging paths
-# v1.5.1f — Previous baseline (night-mode investigation, logging hardening)
+# v1.5.2  - Timezone-aware night mode & daily sun refresh @ 03:00 local
+# v1.5.1f — Night-mode updates, logging hardening
 # v1.5.1e — Night-mode fix + epoch correction
 # ============================================================
 
-FW_VERSION = "v1.5.4"
+FW_VERSION = "v1.5.5"
 
 import time
 import json
@@ -128,6 +120,7 @@ _HEARTBEAT_FLUSH_INTERVAL = 10
 
 # HA discovery refresh
 DAILY_DISCOVERY_REFRESH_S = 24 * 3600
+TZ_CACHE_MAX_AGE_S = 24 * 3600      # force periodic TZ refresh to avoid stale DST offset
 
 # Debug logging
 DEBUG = False
@@ -215,7 +208,7 @@ COL_ERROR = (16, 0, 0)
 pix(COL_BOOT)
 
 # ---- Rolling in-memory log ----
-LOG_BUFFER, _LOG_MAX = [], 500
+LOG_BUFFER, _LOG_MAX = [], 200
 
 # ---------- Time helpers ----------
 def _now_epoch_utc():
@@ -877,28 +870,58 @@ def _write_json_file(path, obj):
 
 def fetch_tz_if_needed(pool, force=False):
     global _TZ_CACHE
+
+    now_ep = _now_epoch_utc()
+
+    # 0) Prefer cached TZ from disk to avoid network calls (unless force=True),
+    # but only while cache is fresh enough.
+    if not force:
+        cache = _read_json_file(TZ_FILE)
+        if cache and isinstance(cache.get("utc_offset_sec", None), int) and isinstance(cache.get("tz", None), str):
+            cache_fresh = True
+            fetched_ep = cache.get("fetched_utc_ep", None)
+            if now_ep is not None and isinstance(fetched_ep, int):
+                cache_fresh = (now_ep - fetched_ep) < TZ_CACHE_MAX_AGE_S
+            elif now_ep is not None:
+                # If clock is valid but cache has no timestamp, force a refresh.
+                cache_fresh = False
+
+            if cache_fresh:
+                _TZ_CACHE = cache
+                debug("Using cached TZ from disk")
+                return True
+
+    # If we already have a valid in-RAM cache, we're done
     if not force and _tz_cache_valid():
         return True
+
     # 1) Try WorldTimeAPI (with one retry)
     try:
         sess = _http_session(pool)
         url = f"https://worldtimeapi.org/api/timezone/{LOCAL_TZ}"
         debug("WorldTimeAPI fetch: " + LOCAL_TZ)
         last_exc = None
-        # NOTE: keep this section watchdog-friendly. Timeouts are bounded
-        # and we feed the WD around each blocking call.
-        for attempt in range(2):  # 1 initial try + 1 retry
+        for attempt in range(2):
+            r = None
             try:
                 WD.feed()
-                r = sess.get(url, timeout=8)
-                data = r.json(); r.close()
+                r = sess.get(url, timeout=15)
+                data = r.json()
+
                 off = data.get("utc_offset", "+00:00")
                 sign = -1 if off.startswith("-") else 1
                 parts = off[1:].split(":")
                 hh = int(parts[0]); mm = int(parts[1]); ss = int(parts[2]) if len(parts) > 2 else 0
                 utc_off_sec = sign * (hh*3600 + mm*60 + ss)
                 abbr = data.get("abbreviation", "")
-                _TZ_CACHE = {"tz": LOCAL_TZ, "utc_offset_sec": utc_off_sec, "abbrev": abbr, "dst": bool(data.get("dst", False))}
+
+                _TZ_CACHE = {
+                    "tz": LOCAL_TZ,
+                    "utc_offset_sec": utc_off_sec,
+                    "abbrev": abbr,
+                    "dst": bool(data.get("dst", False)),
+                    "fetched_utc_ep": now_ep,
+                }
                 _write_json_file(TZ_FILE, _TZ_CACHE)
                 sd_health(f"TZ updated {LOCAL_TZ} off={utc_off_sec} abbr={abbr}")
                 return True
@@ -906,6 +929,12 @@ def fetch_tz_if_needed(pool, force=False):
                 last_exc = e
                 WD.feed()
                 time.sleep(1.5)
+            finally:
+                try:
+                    if r:
+                        r.close()
+                except Exception:
+                    pass
         log_message(f"WorldTimeAPI fetch failed: {last_exc}")
     except Exception as e:
         log_message(f"WorldTimeAPI session error: {e}")
@@ -916,23 +945,39 @@ def fetch_tz_if_needed(pool, force=False):
             sess = _http_session(pool)
             url = ("https://api.openweathermap.org/data/2.5/weather?lat="
                    + str(OW_LAT) + "&lon=" + str(OW_LON) + "&appid=" + str(OW_API_KEY))
+            r = None
             WD.feed()
-            r = sess.get(url, timeout=8)
-            data = r.json(); r.close()
+            try:
+                r = sess.get(url, timeout=8)
+                data = r.json()
+            finally:
+                try:
+                    if r:
+                        r.close()
+                except Exception:
+                    pass
             utc_off_sec = int(data.get("timezone", 0))
-            _TZ_CACHE = {"tz": LOCAL_TZ, "utc_offset_sec": utc_off_sec, "abbrev": "", "dst": None}
+
+            _TZ_CACHE = {
+                "tz": LOCAL_TZ,
+                "utc_offset_sec": utc_off_sec,
+                "abbrev": "",
+                "dst": None,
+                "fetched_utc_ep": now_ep,
+            }
             _write_json_file(TZ_FILE, _TZ_CACHE)
             sd_health(f"TZ fallback via OWM offset={utc_off_sec}")
             return True
     except Exception as e:
         log_message(f"TZ fallback via OWM failed: {e}")
 
-    # 3) Last resort: cached file
+    # 3) Last resort: cached file (keep this as a safety net)
     cache = _read_json_file(TZ_FILE)
     if cache and isinstance(cache.get("utc_offset_sec", None), int):
-        debug("Using cached TZ from disk")
+        debug("Using cached TZ from disk (last resort)")
         _TZ_CACHE = cache
         return True
+
     return False
 
 
@@ -1043,9 +1088,17 @@ def refresh_sun_times_if_due(pool, now_utc_ep, force_if_missing=False):
         sess = _http_session(pool)
         url = ("https://api.openweathermap.org/data/2.5/weather?lat="
                + str(OW_LAT) + "&lon=" + str(OW_LON) + "&appid=" + str(OW_API_KEY))
+        r = None
         WD.feed()
-        r = sess.get(url, timeout=10)
-        data = r.json(); r.close()
+        try:
+            r = sess.get(url, timeout=10)
+            data = r.json()
+        finally:
+            try:
+                if r:
+                    r.close()
+            except Exception:
+                pass
         # Opportunistic TZ set from OWM if needed
         try:
             if (not _tz_cache_valid()) and ("timezone" in data):
@@ -1686,6 +1739,7 @@ def mqtt_publish_with_retries(payload, max_attempts=3):
     last_err = None
     for attempt in range(1, max_attempts+1):
         WD.feed()
+        mqtt = None
         try:
             mqtt = _new_mqtt_client(pool)
             _wdt_sleep(0.3)
@@ -1697,25 +1751,35 @@ def mqtt_publish_with_retries(payload, max_attempts=3):
             publish_ha_discovery(mqtt)
             mqtt.publish(f"{TOPIC_BASE}/state", json.dumps(payload), qos=QOS, retain=False)
             log_message("Publish complete", mqtt=mqtt)
-            try: mqtt.disconnect()
-            except Exception: pass
             return True
         except Exception as e:
             last_err = e
             LAST_ERROR = repr(e)
             log_message(f"MQTT attempt {attempt}/{max_attempts} failed: {e}")
             _wdt_sleep(2 * attempt)
+        finally:
+            try:
+                if mqtt:
+                    mqtt.disconnect()
+            except Exception:
+                pass
     log_message(f"MQTT publish failed after {max_attempts} attempts: {last_err}")
 
+    mqtt2 = None
     try:
         pool2 = socketpool.SocketPool(wifi.radio)
         mqtt2 = _new_mqtt_client(pool2)
         mqtt2.connect()
         mqtt2.publish(f"{TOPIC_BASE}/last_debug_log", "\n".join(LOG_BUFFER[-12:]), qos=0, retain=True)
         mqtt2.publish(f"{TOPIC_BASE}/last_error", repr(last_err) if last_err else "", qos=0, retain=True)
-        mqtt2.disconnect()
     except Exception:
         pass
+    finally:
+        try:
+            if mqtt2:
+                mqtt2.disconnect()
+        except Exception:
+            pass
 
     return False
 
@@ -1942,7 +2006,7 @@ except Exception as e:
         pool = socketpool.SocketPool(wifi.radio)
         mqtt = _new_mqtt_client(pool)
         mqtt.connect()
-        mqtt.publish(f"{TOPIC_BASE}/status", "online", retain=True, qos=0)
+        mqtt.publish(f"{TOPIC_BASE}/status", "offline", retain=True, qos=0)
         mini = {"client_id": CLIENT_ID, "last_error": LAST_ERROR, "fw_version": FW_VERSION, "phase": _PHASE}
         mqtt.publish(f"{TOPIC_BASE}/state", json.dumps(mini), qos=0, retain=False)
         mqtt.publish(f"{TOPIC_BASE}/last_error", LAST_ERROR, qos=0, retain=True)

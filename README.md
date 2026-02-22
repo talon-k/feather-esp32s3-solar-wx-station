@@ -29,6 +29,8 @@ Solar-powered outdoor weather station firmware built for CircuitPython on the Ad
 ## Repository Layout
 
 - `firmware/code.py` - Active weather station firmware (CircuitPython)
+- `firmware/secrets.py` - Credentials/config dictionary for Wi-Fi and MQTT
+- `firmware/settings.toml` - CircuitPython environment variables (OWM + timezone, optional Wi-Fi override)
 
 ## Firmware Notes
 
@@ -47,13 +49,60 @@ cd feather-esp32s3-solar-wx-station
 
 2. Install CircuitPython on your Feather ESP32-S3 and mount `CIRCUITPY`.
 3. Copy `firmware/code.py` to the root of the `CIRCUITPY` drive as `code.py`.
-4. Create/update `secrets.py` with Wi-Fi and MQTT credentials.
-5. Ensure required CircuitPython libraries are present in `CIRCUITPY/lib` (for example: BME280, MiniMQTT, Requests, NTP, DS3231, MAX1704x, SD card support).
+4. Copy `firmware/secrets.py` and `firmware/settings.toml` to the `CIRCUITPY` root, then edit values.
+5. Ensure required CircuitPython libraries are present in `CIRCUITPY/lib`.
 6. Reboot the board and monitor serial logs.
+
+## Required CircuitPython Libraries
+
+Install these from the CircuitPython bundle into `CIRCUITPY/lib`:
+
+- `adafruit_bme280`
+- `adafruit_bus_device`
+- `adafruit_ds3231.mpy`
+- `adafruit_max1704x.mpy`
+- `adafruit_minimqtt`
+- `adafruit_ntp.mpy`
+- `adafruit_register`
+- `adafruit_requests.mpy`
+- `adafruit_sdcard.mpy`
+
+## Configuration Files
+
+The firmware expects both files next to `code.py` on the board.
+
+- `secrets.py` keys:
+  - `ssid`
+  - `password`
+  - `mqtt_broker`
+  - `mqtt_port`
+  - `mqtt_username`
+  - `mqtt_password`
+- `settings.toml` keys:
+  - `OW_API_KEY`
+  - `OW_LAT`
+  - `OW_LON`
+  - `LOCAL_TZ`
+  - Optional: `CIRCUITPY_WIFI_SSID`, `CIRCUITPY_WIFI_PASSWORD`
+
+Keeping dummy `secrets.py` and `settings.toml` under `firmware/` is intentional, since deployment is a straight copy to the board root. Treat repo versions as templates only and never commit real credentials.
 
 ## MQTT / Home Assistant
 
 The firmware publishes state under a configurable topic base and can publish Home Assistant discovery entities for diagnostics and weather telemetry.
+
+## References
+
+- Adafruit Feather ESP32-S3: <https://learn.adafruit.com/adafruit-esp32-s3-feather>
+- Adafruit DS3231 Precision RTC: <https://learn.adafruit.com/adafruit-ds3231-precision-rtc-breakout>
+- Adafruit BME280 Sensor: <https://learn.adafruit.com/adafruit-bme280-humidity-barometric-pressure-temperature-sensor-breakout>
+- Adafruit MicroSD Breakout Board+: <https://learn.adafruit.com/adafruit-micro-sd-breakout-board-card-tutorial>
+- Adafruit bq24074 Charger: <https://learn.adafruit.com/adafruit-bq24074-universal-usb-dc-solar-charger-breakout/design-notes>
+- CircuitPython docs: <https://docs.circuitpython.org/en/latest/>
+- CircuitPython library bundle: <https://circuitpython.org/libraries>
+- Home Assistant MQTT Discovery: <https://www.home-assistant.io/integrations/mqtt/#mqtt-discovery>
+- OpenWeather API: <https://openweathermap.org/current>
+- WorldTimeAPI: <https://worldtimeapi.org/>
 
 ## Project Status
 

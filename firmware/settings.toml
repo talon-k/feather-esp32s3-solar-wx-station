@@ -1,0 +1,11 @@
+# Dummy CircuitPython environment values.
+# Replace placeholders before deployment.
+
+OW_API_KEY = "YOUR_OPENWEATHERMAP_API_KEY"
+OW_LAT = "41.8781"
+OW_LON = "-87.6298"
+LOCAL_TZ = "America/Chicago"
+
+# Optional: override Wi-Fi from settings.toml instead of secrets.py
+# CIRCUITPY_WIFI_SSID = "YOUR_WIFI_SSID"
+# CIRCUITPY_WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
